@@ -1887,6 +1887,7 @@
     facilityCacheMeta: {},
     facilityWarmStarted: {},
     facilityLoadToken: 0,
+    pendingFacilityDeletes: {},
     currentFacilityManager: "Nguyễn Văn Nguyên",
     pendingFacilityManager: "",
     pendingAdminMode: "",
@@ -2325,7 +2326,11 @@
   }
 
   function canEditCurrentFacilityView(managerName = getCurrentFacilityManager()) {
-    return true;
+    return !isTeamFacilityView(managerName);
+  }
+
+  function canCreateInCurrentFacilityView(managerName = getCurrentFacilityManager()) {
+    return !isTeamFacilityView(managerName) || isSystemAdminMode();
   }
 
   function getFacilityViewTitle(managerName = getCurrentFacilityManager()) {
@@ -2333,10 +2338,9 @@
   }
 
   function getFacilityViewHint(managerName = getCurrentFacilityManager()) {
+    if (isTeamFacilityView(managerName)) return "Danh sách tổng hợp chỉ để xem, không cho sửa trực tiếp bằng nhấp đúp.";
     if (isSystemAdminMode()) return "Nhấp đúp vào dòng để chỉnh sửa hoặc chuyển cơ sở sang người khác.";
-    return isTeamFacilityView(managerName)
-      ? ""
-      : "Nhấp đúp vào dòng để mở lại biểu mẫu sửa.";
+    return "Nhấp đúp vào dòng để mở lại biểu mẫu sửa.";
   }
 
   function getFacilityReadyStatus(managerName = getCurrentFacilityManager()) {
@@ -2688,7 +2692,7 @@
   }
 
   function saveFacilitiesForOwner(ownerName, items) {
-    const normalized = sortFacilities((Array.isArray(items) ? items : []).map(item => normalizeFacility({ ...item, owner: ownerName })).filter(item => item.name));
+    const normalized = filterPendingDeletedFacilities(sortFacilities((Array.isArray(items) ? items : []).map(item => normalizeFacility({ ...item, owner: ownerName })).filter(item => item.name)), ownerName);
     saveLocalFacilities(normalized, ownerName);
     setFacilityCache(ownerName, normalized);
     applyOwnerItemsToTeamCache(ownerName, normalized);
@@ -2701,6 +2705,7 @@
   }
 
   function upsertFacilityForOwner(ownerName, facilityItem, replaceId = "") {
+    clearFacilityPendingDelete(replaceId || facilityItem.id);
     const currentItems = getFacilityCache(ownerName).filter(item => item.id !== (replaceId || facilityItem.id));
     currentItems.push(normalizeFacility({ ...facilityItem, owner: ownerName }));
     return saveFacilitiesForOwner(ownerName, currentItems);
@@ -2733,8 +2738,7 @@
   function updateFacilityCreateModeUI() {
     const managerName = getCurrentFacilityManager();
     const isTeamView = isTeamFacilityView(managerName);
-    const canEdit = canEditCurrentFacilityView(managerName);
-    const canCreate = !!canEdit && (!isTeamView || isSystemAdminMode());
+    const canCreate = canCreateInCurrentFacilityView(managerName);
     const saveButton = $("btnSaveFacility");
     const formPanel = $("facilityFormPanel");
     const saveStatus = $("facilitySaveStatus");
@@ -3245,6 +3249,54 @@ function formatDateTime(value) {
     return hasItems && getFacilityCacheAgeMs(key) <= maxAgeMs;
   }
 
+
+  const FACILITY_DELETE_GUARD_MS = 30000;
+
+  function cleanupPendingFacilityDeletes() {
+    const next = {};
+    const now = Date.now();
+    Object.entries(state.pendingFacilityDeletes || {}).forEach(([id, meta]) => {
+      const createdAt = Number(meta && meta.createdAt || 0);
+      if (id && createdAt && (now - createdAt) < FACILITY_DELETE_GUARD_MS) {
+        next[id] = meta;
+      }
+    });
+    state.pendingFacilityDeletes = next;
+    return next;
+  }
+
+  function markFacilityPendingDelete(facilityId, ownerName = '') {
+    const id = String(facilityId || '').trim();
+    if (!id) return;
+    cleanupPendingFacilityDeletes();
+    state.pendingFacilityDeletes[id] = {
+      owner: String(ownerName || '').trim(),
+      createdAt: Date.now()
+    };
+  }
+
+  function clearFacilityPendingDelete(facilityId) {
+    const id = String(facilityId || '').trim();
+    if (!id) return;
+    cleanupPendingFacilityDeletes();
+    delete state.pendingFacilityDeletes[id];
+  }
+
+  function filterPendingDeletedFacilities(items = [], managerName = getCurrentFacilityManager()) {
+    const pending = cleanupPendingFacilityDeletes();
+    const key = String(managerName || '').trim();
+    return (Array.isArray(items) ? items : []).filter(item => {
+      const id = String(item?.id || '').trim();
+      if (!id || !pending[id]) return true;
+      const owner = String(item?.owner || '').trim();
+      const pendingOwner = String(pending[id]?.owner || '').trim();
+      if (!pendingOwner) return false;
+      if (pendingOwner && owner && pendingOwner === owner) return false;
+      if (key && pendingOwner === key) return false;
+      return !(isTeamFacilityView(key) && pendingOwner);
+    });
+  }
+
   function flushFacilityLocalWrite(storageKey) {
     try {
       const payload = facilityLocalWriteCache.get(storageKey);
@@ -3267,7 +3319,7 @@ function formatDateTime(value) {
   function saveLocalFacilities(items, managerName = getCurrentFacilityManager()) {
     if (isTeamFacilityView(managerName)) return [];
     try {
-      const normalized = sortFacilities((Array.isArray(items) ? items : []).map(item => normalizeFacility({ ...item, owner: managerName })).filter(item => item.name));
+      const normalized = filterPendingDeletedFacilities(sortFacilities((Array.isArray(items) ? items : []).map(item => normalizeFacility({ ...item, owner: managerName })).filter(item => item.name)), managerName);
       const key = getFacilityStorageKey(managerName);
       const payload = JSON.stringify(normalized);
       facilityLocalWriteCache.set(key, payload);
@@ -3293,7 +3345,7 @@ function formatDateTime(value) {
       if (!raw) return [];
       const parsed = JSON.parse(raw);
       return Array.isArray(parsed)
-        ? sortFacilities(parsed.map(item => normalizeFacility({ ...item, owner: item?.owner || managerName })).filter(item => item.name))
+        ? filterPendingDeletedFacilities(sortFacilities(parsed.map(item => normalizeFacility({ ...item, owner: item?.owner || managerName })).filter(item => item.name)), managerName)
         : [];
     } catch (err) {
       console.warn('Không đọc được dữ liệu cơ sở cục bộ:', err);
@@ -3304,8 +3356,8 @@ function formatDateTime(value) {
   function setFacilityCache(managerName = getCurrentFacilityManager(), items = [], meta = {}) {
     const key = managerName || getCurrentFacilityManager();
     const normalized = isTeamFacilityView(key)
-      ? dedupeFacilities(items)
-      : sortFacilities((Array.isArray(items) ? items : []).map(item => normalizeFacility(item)).filter(item => item.name));
+      ? filterPendingDeletedFacilities(dedupeFacilities(items), key)
+      : filterPendingDeletedFacilities(sortFacilities((Array.isArray(items) ? items : []).map(item => normalizeFacility(item)).filter(item => item.name)), key);
     state.facilityCache[key] = normalized;
     setFacilityCacheMeta(key, {
       source: meta.source || getFacilityCacheMeta(key).source || 'memory',
@@ -3320,7 +3372,9 @@ function formatDateTime(value) {
     const key = managerName || getCurrentFacilityManager();
     const cached = state.facilityCache[key];
     if (Array.isArray(cached)) {
-      return isTeamFacilityView(key) ? dedupeFacilities(cached) : sortFacilities(cached);
+      return isTeamFacilityView(key)
+        ? filterPendingDeletedFacilities(dedupeFacilities(cached), key)
+        : filterPendingDeletedFacilities(sortFacilities(cached), key);
     }
     const localItems = loadLocalFacilities(key);
     if (Array.isArray(localItems) && localItems.length) return setFacilityCache(key, localItems, { source: 'local' });
@@ -3662,7 +3716,10 @@ function formatDateTime(value) {
   }
 
   function openFacilityForEdit(facilityId) {
-    openFacilityEditModal(facilityId);
+    if (!canEditCurrentFacilityView()) return;
+    const id = String(facilityId || '').trim();
+    if (!id) return;
+    openFacilityEditModal(id);
   }
 
   function readFacilityFiltersFromInputs() {
@@ -4039,19 +4096,22 @@ function formatDateTime(value) {
 
     ensureAllTableHeaderFilters();
 
+    const allowInlineEdit = canEditCurrentFacilityView();
     filteredFacilities.forEach((item, idx) => {
       const tr = document.createElement('tr');
       tr.dataset.id = item.id;
-      tr.title = 'Nhấp đúp để chỉnh sửa cơ sở' + (item.owner ? ' - ' + item.owner : '');
-      tr.setAttribute('ondblclick', `openFacilityForEdit(${JSON.stringify(String(item.id || ''))})`);
+      if (allowInlineEdit) {
+        tr.title = 'Nhấp đúp để chỉnh sửa cơ sở' + (item.owner ? ' - ' + item.owner : '');
+      } else {
+        tr.title = item.owner ? ('Cơ sở do ' + item.owner + ' quản lý') : 'Danh sách tổng hợp chỉ để xem';
+      }
       if (state.selectedFacilityId && state.selectedFacilityId === item.id) {
         tr.classList.add('facility-row-active');
       }
-      const openIdAttr = escapeHtml(item.id || '');
       tr.innerHTML = `
         <td class="facility-col-stt">${idx + 1}</td>
         <td class="facility-col-code">${escapeHtml(item.code || '-')}</td>
-        <td class="facility-col-name"><div class="facility-cell-main" data-facility-open="${openIdAttr}" ondblclick="openFacilityForEdit('${openIdAttr}');event.stopPropagation();" title="Nhấp đúp để sửa cơ sở">${escapeHtml(item.name || '-')}</div>${item.description ? `<div class="facility-cell-sub" data-facility-open="${openIdAttr}" ondblclick="openFacilityForEdit('${openIdAttr}');event.stopPropagation();" title="Nhấp đúp để sửa cơ sở">${escapeHtml(item.description)}</div>` : ''}</td>
+        <td class="facility-col-name"><div class="facility-cell-main">${escapeHtml(item.name || '-')}</div>${item.description ? `<div class="facility-cell-sub">${escapeHtml(item.description)}</div>` : ''}</td>
         <td>${escapeHtml(item.address || '-')}</td>
         <td>${escapeHtml(item.field || '-')}</td>
         <td>${escapeHtml(item.appendix || '-')}</td>
@@ -4070,7 +4130,7 @@ function formatDateTime(value) {
 
   async function handleSaveFacility() {
     const managerName = getCurrentFacilityManager();
-    if (!canEditCurrentFacilityView(managerName)) return;
+    if (!canCreateInCurrentFacilityView(managerName)) return;
 
     const isTeamCreate = isTeamFacilityView(managerName);
     const targetOwner = isTeamCreate ? String($('facilityCreateOwner')?.value || '').trim() : managerName;
@@ -4325,7 +4385,11 @@ function formatDateTime(value) {
     if (!confirm('Bạn chắc chắn muốn xóa cơ sở "' + facility.name + '"?')) return;
 
     const ownerName = facility.owner || getCurrentFacilityManager();
+    markFacilityPendingDelete(id, ownerName);
     removeFacilityFromOwner(ownerName, id);
+    flushFacilityLocalWrite(getFacilityStorageKey(ownerName));
+    setFacilityCacheMeta(ownerName, { loadedAt: 0 });
+    setFacilityCacheMeta(TEAM_FACILITY_LABEL, { loadedAt: 0 });
     state.selectedFacilityId = '';
     syncFacilityStateFromCaches();
     closeFacilityEditModal();
@@ -4336,12 +4400,19 @@ function formatDateTime(value) {
 
     const result = await deleteFacilityRemote(id, ownerName);
     if (!result || !result.ok) {
+      clearFacilityPendingDelete(id);
       upsertFacilityForOwner(ownerName, facility);
       syncFacilityStateFromCaches();
       setFacilityStatus('warning', ((result && (result.error || result.message)) || 'Không xóa được trên hệ thống.') + ' Hệ thống đã khôi phục bản ghi cục bộ.');
       return;
     }
 
+    void refreshFacilityCacheFromRemote(ownerName, { fresh: true }).then(() => {
+      if (getCurrentFacilityManager() === ownerName) syncFacilityStateFromCaches();
+    }).catch(() => {});
+    void refreshFacilityCacheFromRemote(TEAM_FACILITY_LABEL, { fresh: true }).then(() => {
+      if (isTeamFacilityView()) syncFacilityStateFromCaches();
+    }).catch(() => {});
     setFacilityStatus('success', 'Đã xóa cơ sở thành công.');
   }
 
@@ -5087,26 +5158,6 @@ function formatDateTime(value) {
   window.openReportIssueModal = openReportIssueModal;
   window.handleSaveReportIssue = handleSaveReportIssue;
 
-  if ($('btnSaveFacility')) $('btnSaveFacility').addEventListener('click', handleSaveFacility);
-  if ($('btnSaveFacilityModal')) $('btnSaveFacilityModal').addEventListener('click', handleSaveFacilityModal);
-  if ($('btnDeleteFacilityModal')) $('btnDeleteFacilityModal').addEventListener('click', handleDeleteFacilityModal);
-  if ($('btnCancelFacilityModal')) $('btnCancelFacilityModal').addEventListener('click', closeFacilityEditModal);
-  if ($('btnFacilityExport')) $('btnFacilityExport').addEventListener('click', exportFacilitiesExcel);
-  if ($('btnFacilityPrint')) $('btnFacilityPrint').addEventListener('click', printVisibleFacilities);
-  if ($('btnFacilityLogout')) $('btnFacilityLogout').addEventListener('click', closeFacilityManager);
-  ['facilityCreateOwner','facilityCode','facilityFileNumber','facilityName','facilityDescription','facilityAddress','facilityField','facilityAppendix'].forEach(id => {
-    if ($(id)) $(id).addEventListener('keydown', (event) => handleEnterToSave(event, handleSaveFacility));
-  });
-  ['facilityEditCode','facilityEditFileNumber','facilityEditName','facilityEditDescription','facilityEditAddress','facilityEditField','facilityEditAppendix','facilityEditOwner','facilityEditInspectionDate','facilityEditInsuranceDate','facilityEditInsuranceCompany','facilityEditMaintenanceDate','facilityEditMaintenanceCompany','facilityEditDrill','facilityEditTraining','facilityEditIssueType'].forEach(id => {
-    if ($(id)) $(id).addEventListener('keydown', (event) => handleEnterToSave(event, handleSaveFacilityModal, { onEscape: closeFacilityEditModal }));
-  });
-  ['facilityFilterName','facilityFilterDescription','facilityFilterAddress','facilityFilterField','facilityFilterAppendix','facilityFilterCodeStatus','facilityFilterOwner'].forEach(id => {
-    if (!$(id)) return;
-    const eventName = $(id).tagName === 'SELECT' || $(id).type === 'date' ? 'change' : 'input';
-    $(id).addEventListener(eventName, applyFacilityFilters);
-    if (eventName !== 'change') $(id).addEventListener('change', applyFacilityFilters);
-  });
-  if ($('btnClearFacilityFilters')) $('btnClearFacilityFilters').addEventListener('click', () => resetFacilityFilters());
   document.querySelectorAll('.facility-summary-box[data-view]').forEach(box => {
     box.addEventListener('click', () => setFacilityQuickView(box.dataset.view || 'all'));
   });
@@ -5510,7 +5561,7 @@ function formatDateTime(value) {
   if ($('btnReportPrint')) $('btnReportPrint').addEventListener('click', printReportDashboard);
   if ($('btnFacilityExport')) $('btnFacilityExport').addEventListener('click', exportFacilitiesExcel);
   if ($('btnFacilityPrint')) $('btnFacilityPrint').addEventListener('click', printVisibleFacilities);
-  if ($('btnFacilityLogout')) $('btnFacilityLogout').addEventListener('click', closeFacilityManager);
+  if ($('btnFacilityLogout')) $('btnFacilityLogout').onclick = () => closeFacilityManager({ skipHistory: true });
   if ($('btnSaveFacility')) $('btnSaveFacility').addEventListener('click', handleSaveFacility);
   if ($('btnClearFacilityFilters')) $('btnClearFacilityFilters').addEventListener('click', () => resetFacilityFilters());
   if ($('btnSavePasswordConfigs')) $('btnSavePasswordConfigs').addEventListener('click', handleSavePasswordConfigs);
@@ -5570,14 +5621,10 @@ function formatDateTime(value) {
   });
 
   if ($('facilityBody')) $('facilityBody').addEventListener('dblclick', (event) => {
+    if (!canEditCurrentFacilityView()) return;
     if (event.target.closest('a, button, input, textarea, select, label')) return;
-    const explicitTarget = event.target.closest('[data-facility-open]');
-    if (explicitTarget && explicitTarget.dataset.facilityOpen) {
-      openFacilityForEdit(explicitTarget.dataset.facilityOpen);
-      return;
-    }
     const row = event.target.closest('tr[data-id]');
-    if (!row) return;
+    if (!row || !row.dataset.id) return;
     openFacilityForEdit(row.dataset.id);
   });
 
